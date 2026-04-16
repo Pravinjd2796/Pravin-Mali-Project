@@ -90,7 +90,7 @@ async def send_interactive_buttons(to: str):
                 )
             },
             "footer": {
-                "text": "📞 मदतीसाठी संपर्क: 99758 02584"
+                "text": "📞 मदतीसाठी संपर्क: 9277115511"
             },
             "action": {
                 "button": "पर्याय निवडा",
@@ -167,7 +167,7 @@ async def send_acknowledgement(to: str, option_title: str):
         "आम्ही तुमची तक्रार नोंदवून लवकरच कार्यवाही करू.\n\n"
         "गैरसोयीबद्दल क्षमस्व. 🙏\n\n"
         "अधिक मदतीसाठी संपर्क:\n"
-        "📞 *99758 02584*"
+        "📞 *9277115511*"
     )
     
     await send_text_message(to, text)
@@ -202,7 +202,7 @@ async def send_image_received_response(to: str):
         "तुमची तक्रार यशस्वीरित्या नोंदवली गेली आहे.\n\n"
         "गैरसोयीबद्दल क्षमस्व, आम्ही लवकरच याबाबत कार्यवाही करू. 🙏\n\n"
         "अधिक मदतीसाठी कृपया खालील क्रमांकावर संपर्क साधा:\n"
-        "📞 *99758 02584*"
+        "📞 *9277115511*"
     )
     await send_text_message(to, text)
 
