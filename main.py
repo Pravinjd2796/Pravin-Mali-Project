@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import PlainTextResponse
 import httpx
+import time
+import json
 
 # ─── Load Environment ────────────────────────────────────────────────────────
 load_dotenv()
@@ -29,6 +31,11 @@ logger = logging.getLogger(__name__)
 # Tracks which user is at which step in the conversation flow
 # Key: phone number, Value: dict with "state" and optional "selected_option"
 user_sessions: dict[str, dict] = {}
+
+# Deduplication: Track processed message IDs to prevent double-replies from Meta retries
+# Note: In production, use a database/cache with a TTL. For now, we use a simple set.
+PROCESSED_MESSAGES = set()
+MAX_PROCESSED_HISTORY = 1000  # Prevent memory leak
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -387,8 +394,37 @@ async def receive_webhook(request: Request):
                 messages = value.get("messages", [])
 
                 for msg in messages:
-                    sender = msg.get("from")  # sender's phone number
-                    logger.info(f"Processing message from {sender}: type={msg.get('type')}")
+                    msg_id = msg.get("id")
+                    timestamp_str = msg.get("timestamp")
+                    sender = msg.get("from")
+
+                    # 1. Deduplication (Skip if already processed)
+                    if msg_id in PROCESSED_MESSAGES:
+                        logger.info(f"Skipping duplicate message: {msg_id}")
+                        continue
+                    
+                    # 2. Expiry Check (Skip if message is older than 5 minutes)
+                    if timestamp_str:
+                        try:
+                            msg_ts = int(timestamp_str)
+                            now_ts = int(time.time())
+                            if now_ts - msg_ts > 300: # 5 minutes
+                                logger.info(f"Skipping expired message (old retry): {msg_id}")
+                                continue
+                        except Exception:
+                            pass
+
+                    # Mark as processed
+                    PROCESSED_MESSAGES.add(msg_id)
+                    
+                    # Prevent memory leak by keeping only the last 1000 IDs
+                    if len(PROCESSED_MESSAGES) > MAX_PROCESSED_HISTORY:
+                        # Convert to list to pop first element (simple FIFO)
+                        msg_list = list(PROCESSED_MESSAGES)
+                        PROCESSED_MESSAGES.clear()
+                        PROCESSED_MESSAGES.update(msg_list[-MAX_PROCESSED_HISTORY:])
+
+                    logger.info(f"Processing message from {sender}: type={msg.get('type')} id={msg_id}")
                     await process_message(sender, msg)
 
     except Exception as exc:
