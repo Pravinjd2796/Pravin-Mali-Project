@@ -303,7 +303,10 @@ async def process_message(sender: str, message: dict):
                 }
                 await send_image_request(sender, option_label)
             else:
-                user_sessions[sender] = {"state": "idle"}
+                user_sessions[sender] = {
+                    "state": "awaiting_details",
+                    "selected_option": selected_id,
+                }
                 await send_acknowledgement(sender, option_label)
             return
 
