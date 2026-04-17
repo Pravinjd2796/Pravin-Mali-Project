@@ -259,8 +259,11 @@ async def process_message(sender: str, message: dict):
                 }
                 await send_image_request(sender, option_label)
             else:
-                # Options 1, 2, 3 → acknowledge directly
-                user_sessions[sender] = {"state": "idle"}
+                # Options 1, 2, 3 → ask for details (awaiting_details state)
+                user_sessions[sender] = {
+                    "state": "awaiting_details",
+                    "selected_option": selected_id,
+                }
                 await send_acknowledgement(sender, option_label)
             return
 
@@ -309,6 +312,15 @@ async def process_message(sender: str, message: dict):
             await send_text_message(
                 sender,
                 "⚠️ कृपया फोटो पाठवा. तक्रार नोंदवण्यासाठी फोटो आवश्यक आहे. 📸"
+            )
+            return
+
+        # Handle details being sent (Name, Address, etc.)
+        if session.get("state") == "awaiting_details":
+            user_sessions[sender] = {"state": "idle"}
+            await send_text_message(
+                sender,
+                "✅ तुमची माहिती मिळाली आहे!\n\nतुमची तक्रार यशस्वीरित्या नोंदवली गेली आहे. गैरसोयीबद्दल क्षमस्व, आम्ही लवकरच याबाबत कार्यवाही करू. 🙏"
             )
             return
 
