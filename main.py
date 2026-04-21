@@ -1,7 +1,7 @@
 """
 WhatsApp Bot - Pravin Mali Help Line
 Built with FastAPI + Meta WhatsApp Business Cloud API
-Phone: +1 555 634 7743
+Phone: +91 9272511811
 Language: Marathi
 """
 
@@ -444,7 +444,7 @@ async def health_check():
     return {
         "status": "running",
         "bot": "Pravin Mali Help Line",
-        "phone": "+1 555 634 7743",
+        "phone": "+91 9272511811",
         "language": "Marathi (मराठी)",
     }
 
