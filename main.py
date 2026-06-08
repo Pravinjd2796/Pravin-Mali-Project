@@ -97,7 +97,7 @@ async def send_interactive_buttons(to: str):
                 )
             },
             "footer": {
-                "text": "📞 मदतीसाठी संपर्क: 9277115511"
+                "text": "नगरसेवक प्रविण माळी | हेल्पलाईन"
             },
             "action": {
                 "button": "पर्याय निवडा",
@@ -172,9 +172,7 @@ async def send_acknowledgement(to: str, option_title: str):
         "🏠 पत्ता\n"
         "📞 मोबाईल नंबर\n\n"
         "आम्ही तुमची तक्रार नोंदवून लवकरच कार्यवाही करू.\n\n"
-        "गैरसोयीबद्दल क्षमस्व. 🙏\n\n"
-        "अधिक मदतीसाठी संपर्क:\n"
-        "📞 *9277115511*"
+        "गैरसोयीबद्दल क्षमस्व. 🙏"
     )
     
     await send_text_message(to, text)
