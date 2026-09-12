@@ -27,7 +27,9 @@ WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages
 
 # ─── Complaint forwarding + manual reply relay ───────────────────────────────
 # OWNER_PHONE receives every complaint and can reply to citizens with "#47 text".
-OWNER_PHONE = os.getenv("OWNER_PHONE", "").strip()
+# One or more owners, comma separated: "917620391327,919975802584"
+OWNER_PHONES = [p.strip() for p in os.getenv("OWNER_PHONE", "").split(",") if p.strip()]
+OWNER_PHONE = OWNER_PHONES[0] if OWNER_PHONES else ""
 ALERT_TEMPLATE = os.getenv("ALERT_TEMPLATE", "complaint_forward").strip()
 ALERT_TEMPLATE_LANG = os.getenv("ALERT_TEMPLATE_LANG", "en_US").strip()
 
@@ -397,7 +399,7 @@ async def notify_owner(ticket: str, complaint_type: str, details: str, citizen: 
     Plain text is tried first because it carries the #ticket reply instructions.
     It only works inside the 24-hour window, so the template is the fallback.
     """
-    if not OWNER_PHONE:
+    if not OWNER_PHONES:
         return
 
     text = (
@@ -409,21 +411,20 @@ async def notify_owner(ticket: str, complaint_type: str, details: str, citizen: 
         f"किंवा या मेसेजला थेट Reply करा.\n"
         f"संभाषण संपवण्यासाठी: `{ticket} done`"
     )
-    resp = await send_text_message(OWNER_PHONE, text)
-    if resp is not None and resp.status_code == 200:
-        # Remember which alert this was, so a WhatsApp "reply" to it routes back
-        # to the right citizen without the owner typing the ticket number.
-        try:
-            wamid = resp.json()["messages"][0]["id"]
-            alert_msg_to_ticket[wamid] = ticket
-        except Exception:
-            pass
-        return
-
-    # Outside the 24-hour window — fall back to the approved template.
-    logger.info("Owner outside 24h window, sending template instead")
     flat = details.replace("\n", " / ")
-    await send_template_alert(OWNER_PHONE, f"#{ticket} {complaint_type}", flat, f"+{citizen}")
+    for owner in OWNER_PHONES:
+        resp = await send_text_message(owner, text)
+        if resp is not None and resp.status_code == 200:
+            # Remember this alert so a WhatsApp "reply" to it routes back to the
+            # right citizen without the owner typing the ticket number.
+            try:
+                alert_msg_to_ticket[resp.json()["messages"][0]["id"]] = ticket
+            except Exception:
+                pass
+            continue
+        # Outside the 24-hour window — fall back to the approved template.
+        logger.info(f"{owner} outside 24h window, sending template instead")
+        await send_template_alert(owner, f"#{ticket} {complaint_type}", flat, f"+{citizen}")
 
 
 async def register_complaint(citizen: str, complaint_type: str, details: str):
@@ -456,7 +457,7 @@ async def register_complaint(citizen: str, complaint_type: str, details: str):
 OWNER_GREETINGS = {"hi", "hello", "hey", "नमस्कार", "नमस्ते", "हाय", "हॅलो", "menu", "मेनू"}
 
 
-async def handle_owner_command(text: str, reply_to: str | None = None) -> bool:
+async def handle_owner_command(text: str, sender: str, reply_to: str | None = None) -> bool:
     """
     Handle a message from the owner. The ticket can be given three ways:
 
@@ -492,14 +493,15 @@ async def handle_owner_command(text: str, reply_to: str | None = None) -> bool:
     ticket_to_phone[ticket] = citizen
 
     if not body:
-        await send_text_message(OWNER_PHONE, f"⚠️ संदेश रिकामा आहे. वापरा: {ticket} तुमचा संदेश")
+        await send_text_message(sender, f"⚠️ संदेश रिकामा आहे. वापरा: {ticket} तुमचा संदेश")
         return True
 
     # End the handoff — the bot takes over again.
     if body.lower() in {"done", "end", "close", "बंद"}:
         handoff_until.pop(citizen, None)
         user_sessions[citizen] = {"state": "idle"}
-        await send_text_message(OWNER_PHONE, f"✅ #{ticket} बंद केले. बॉट पुन्हा सुरू.")
+        for owner in OWNER_PHONES:
+            await send_text_message(owner, f"✅ #{ticket} बंद केले. बॉट पुन्हा सुरू.")
         return True
 
     # Relay the owner's message to the citizen, from the helpline number.
@@ -507,10 +509,14 @@ async def handle_owner_command(text: str, reply_to: str | None = None) -> bool:
     if resp is not None and resp.status_code == 200:
         handoff_until[citizen] = time.time() + HANDOFF_MINUTES * 60
         await sheet_record_reply(ticket, body)
-        await send_text_message(OWNER_PHONE, f"✅ #{ticket} ला पाठवले.")
+        await send_text_message(sender, f"✅ #{ticket} ला पाठवले.")
+        # Keep the other owners in the loop so nobody replies twice.
+        for owner in OWNER_PHONES:
+            if owner != sender:
+                await send_text_message(owner, f"↪️ *#{ticket}* +{sender} यांनी उत्तर दिले:\n{body}")
     else:
         await send_text_message(
-            OWNER_PHONE,
+            sender,
             f"❌ #{ticket} ला पाठवता आले नाही. नागरिकाने २४ तासांत संदेश पाठवलेला नसावा.",
         )
     return True
@@ -519,7 +525,8 @@ async def handle_owner_command(text: str, reply_to: str | None = None) -> bool:
 async def forward_citizen_reply(citizen: str, text: str) -> None:
     """During a handoff, pass what the citizen says straight to the owner."""
     ticket = phone_to_ticket.get(citizen, "?")
-    await send_text_message(OWNER_PHONE, f"💬 *#{ticket}* +{citizen}:\n{text}")
+    for owner in OWNER_PHONES:
+        await send_text_message(owner, f"💬 *#{ticket}* +{citizen}:\n{text}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -556,10 +563,10 @@ async def process_message(sender: str, message: dict):
     session = user_sessions.get(sender, {"state": "idle"})
 
     # ── Owner commands: "#47 message" / "#47 done" ────────────────────────
-    if OWNER_PHONE and sender == OWNER_PHONE and msg_type == "text":
+    if sender in OWNER_PHONES and msg_type == "text":
         owner_text = message.get("text", {}).get("body", "").strip()
         reply_to = message.get("context", {}).get("id")
-        if await handle_owner_command(owner_text, reply_to):
+        if await handle_owner_command(owner_text, sender, reply_to):
             return
 
     # ── Handoff: owner is talking to this citizen, so the bot keeps quiet ──
