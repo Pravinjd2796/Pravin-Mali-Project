@@ -76,6 +76,19 @@ alert_msg_to_ticket: dict[str, str] = {}
 # The most recent ticket, used when the owner just types a message with no tag.
 last_ticket: str | None = None
 
+# Ticket numbers used when the Sheet is unavailable. Kept unique and clear of
+# the Sheet's own row numbers, so two complaints can never share a ticket.
+_fallback_seq = 0
+
+
+def _next_fallback_ticket() -> str:
+    global _fallback_seq
+    while True:
+        _fallback_seq += 1
+        candidate = str(9000 + _fallback_seq)
+        if candidate not in ticket_to_phone:
+            return candidate
+
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Pravin Mali Help Line",
@@ -439,7 +452,7 @@ async def register_complaint(citizen: str, complaint_type: str, details: str):
         "",
         "",
     ])
-    ticket = str(row_no) if row_no else str(int(time.time()) % 10000)
+    ticket = str(row_no) if row_no else _next_fallback_ticket()
 
     global last_ticket
     ticket_to_phone[ticket] = citizen
