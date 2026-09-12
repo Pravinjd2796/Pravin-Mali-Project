@@ -79,12 +79,20 @@ last_ticket: str | None = None
 # The first owner to reply to a ticket claims it, so a complainant never gets two
 # answers. The claim lapses after HANDOFF_MINUTES so a forgotten ticket frees
 # itself and somebody else can step in.
-# Key: ticket, Value: (owner phone, unix time the claim expires)
-ticket_claimed_by: dict[str, tuple[str, float]] = {}
+# Key: citizen phone, Value: (owner phone, unix time the claim expires)
+claimed_by: dict[str, tuple[str, float]] = {}
 
 # Tickets that were closed with "done". Replying to one is allowed — people do
 # follow up — but every owner is told it was reopened.
 closed_tickets: set[str] = set()
+
+MAX_TRACKED = 1000        # keep the in-memory books from growing without bound
+
+
+def _prune(store) -> None:
+    """Drop the oldest entries once a tracking store gets too large."""
+    while len(store) > MAX_TRACKED:
+        store.pop() if isinstance(store, set) else store.pop(next(iter(store)))
 
 # Ticket numbers used when the Sheet is unavailable. Kept unique and clear of
 # the Sheet's own row numbers, so two complaints can never share a ticket.
@@ -519,33 +527,40 @@ async def handle_owner_command(text: str, sender: str, reply_to: str | None = No
         await send_text_message(sender, f"⚠️ संदेश रिकामा आहे. वापरा: {ticket} तुमचा संदेश")
         return True
 
-    # Whoever replied first owns this ticket, until the claim lapses.
-    claim = ticket_claimed_by.get(ticket)
-    if claim and claim[0] != sender and time.time() < claim[1]:
-        mins = max(1, int((claim[1] - time.time()) // 60))
-        await send_text_message(
-            sender,
-            f"🔒 *#{ticket}* आधीच +{claim[0]} हाताळत आहेत.\n"
-            f"कृपया दुसरे उत्तर पाठवू नका.\n"
-            f"({mins} मिनिटांनंतर तुम्ही उत्तर देऊ शकता.)",
-        )
-        return True
-
-    # End the handoff — the bot takes over again.
+    # Closing works for any owner — never swallow a "done".
     if body.lower() in {"done", "end", "close", "बंद"}:
         handoff_until.pop(citizen, None)
-        ticket_claimed_by.pop(ticket, None)
+        claimed_by.pop(citizen, None)
         closed_tickets.add(ticket)
+        _prune(closed_tickets)
         user_sessions[citizen] = {"state": "idle"}
         for owner in OWNER_PHONES:
             await send_text_message(owner, f"✅ #{ticket} बंद केले. बॉट पुन्हा सुरू.")
         return True
 
+    # Whoever replies first handles this citizen, until the claim lapses.
+    # Keyed by citizen, not ticket: one person must never get two answers, even
+    # if their complaints carry different ticket numbers.
+    now = time.time()
+    claim = claimed_by.get(citizen)
+    if claim and claim[0] != sender and now < claim[1]:
+        await send_text_message(
+            sender,
+            f"🔒 *#{ticket}* आधीच +{claim[0]} हाताळत आहेत.\n"
+            f"कृपया दुसरे उत्तर पाठवू नका.\n"
+            f"ते थांबल्यावर ({HANDOFF_MINUTES} मिनिटे) तुम्ही उत्तर देऊ शकता.",
+        )
+        return True
+
+    # Claim BEFORE sending. Two owners replying at the same moment would both
+    # clear the check above while the first send was still in flight.
+    claimed_by[citizen] = (sender, now + HANDOFF_MINUTES * 60)
+    _prune(claimed_by)
+
     # Relay the owner's message to the citizen, from the helpline number.
     resp = await send_text_message(citizen, body)
     if resp is not None and resp.status_code == 200:
         handoff_until[citizen] = time.time() + HANDOFF_MINUTES * 60
-        ticket_claimed_by[ticket] = (sender, time.time() + HANDOFF_MINUTES * 60)
         reopened = ticket in closed_tickets
         closed_tickets.discard(ticket)
         await sheet_record_reply(ticket, body)
@@ -558,6 +573,7 @@ async def handle_owner_command(text: str, sender: str, reply_to: str | None = No
             elif reopened:
                 await send_text_message(owner, f"⚠️ #{ticket} बंद झाले होते — पुन्हा सुरू केले.")
     else:
+        claimed_by.pop(citizen, None)        # send failed, let someone else try
         await send_text_message(
             sender,
             f"❌ #{ticket} ला पाठवता आले नाही. नागरिकाने २४ तासांत संदेश पाठवलेला नसावा.",
