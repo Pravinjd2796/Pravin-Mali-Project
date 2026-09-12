@@ -1,0 +1,25 @@
+name: Keep Render instance awake
+
+# Render free instances spin down after ~15 minutes of inactivity, which makes
+# the next WhatsApp message wait ~50s for a cold boot. This pings the health
+# endpoint so the instance stays warm.
+#
+# NOTE: GitHub's scheduler is best-effort and often runs late, so this is a
+# backup. A dedicated pinger (cron-job.org) is the reliable primary.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:        # lets you trigger it by hand from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          code=$(curl -sS -o /dev/null -w '%{http_code}' \
+                 --max-time 120 \
+                 https://pravin-mali-project.onrender.com/)
+          echo "HTTP $code"
+          test "$code" = "200"
