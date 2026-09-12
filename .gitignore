@@ -35,3 +35,5 @@ pravin_mali_marriage_Cert.jpg
 *.jpeg
 *.png
 !sunshine_advertising/static/images/*
+*.json
+!package.json

@@ -271,20 +271,30 @@ def _get_worksheet():
     ws = gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
 
     # Write the header row once, on a blank sheet.
-    if not ws.get_all_values():
-        ws.append_row(SHEET_HEADER)
+    # A blank sheet can come back as [] or as [[]], so check for real content.
+    rows = ws.get_all_values()
+    if not any(any(cell.strip() for cell in row) for row in rows):
+        ws.update(values=[SHEET_HEADER], range_name="A1")
 
     _worksheet = ws
     return _worksheet
 
 
 def _sheet_append_sync(row: list) -> int:
-    """Append a complaint row. Returns the ticket number (the row number)."""
+    """
+    Append a complaint row and return its ticket number.
+
+    The ticket is worked out before the write and placed in column A, so the
+    row lands complete — no second call to fill it in afterwards.
+    """
     ws = _get_worksheet()
     if ws is None:
         return 0
+    ticket = max(1, len(ws.get_all_values()))   # header counts as row 1
+    row = list(row)
+    row[0] = str(ticket)
     ws.append_row(row, value_input_option="USER_ENTERED")
-    return len(ws.col_values(1)) - 1  # minus the header row
+    return ticket
 
 
 def _sheet_lookup_phone_sync(ticket: str) -> str | None:
@@ -306,8 +316,8 @@ def _sheet_record_reply_sync(ticket: str, reply: str) -> None:
     for idx, row in enumerate(ws.get_all_values()[1:], start=2):
         if row and row[0] == ticket:
             ws.update(
-                f"F{idx}:H{idx}",
-                [["Replied", reply, datetime.now(IST).strftime("%d-%m-%Y %H:%M")]],
+                values=[["Replied", reply, datetime.now(IST).strftime("%d-%m-%Y %H:%M")]],
+                range_name=f"F{idx}:H{idx}",
             )
             return
 
@@ -414,15 +424,6 @@ async def register_complaint(citizen: str, complaint_type: str, details: str):
         "",
     ])
     ticket = str(row_no) if row_no else str(int(time.time()) % 10000)
-
-    # Write the ticket number back into the row we just created.
-    if row_no:
-        try:
-            await asyncio.to_thread(
-                lambda: _get_worksheet().update_acell(f"A{row_no + 1}", ticket)
-            )
-        except Exception as exc:
-            logger.error(f"Ticket write-back failed: {exc}")
 
     ticket_to_phone[ticket] = citizen
     phone_to_ticket[citizen] = ticket
