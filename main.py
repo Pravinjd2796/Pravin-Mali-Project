@@ -509,9 +509,16 @@ async def register_complaint(citizen: str, complaint_type: str, details: str,
     await notify_owner(ticket, complaint_type, details, citizen)
 
     # Send the actual photo on to every owner, right after the alert.
+    # The caption repeats the complaint details so the photo stands on its own
+    # if it is forwarded on to a worker or looked at days later.
     if media_id:
+        caption = (
+            f"📷 *#{ticket}* — {complaint_type}\n"
+            f"माहिती: {details}\n"
+            f"नागरिक: +{citizen}"
+        )
         for owner in OWNER_PHONES:
-            await send_image_by_id(owner, media_id, f"📷 #{ticket} — {complaint_type}")
+            await send_image_by_id(owner, media_id, caption)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -710,14 +717,13 @@ async def process_message(sender: str, message: dict):
         option_label = OPTION_LABELS.get(session.get("selected_option"), "अज्ञात")
         caption = message.get("image", {}).get("caption", "").strip()
         media_id = message.get("image", {}).get("id")
+        typed = session.get("details", "").strip()
         user_sessions[sender] = {"state": "idle"}
         await send_image_received_response(sender)
-        await register_complaint(
-            sender,
-            option_label,
-            f"{caption} [फोटो पाठवला]" if caption else "[फोटो पाठवला]",
-            media_id=media_id,
-        )
+
+        parts = [p for p in (typed, caption) if p]
+        details = " / ".join(parts) + " [फोटो पाठवला]" if parts else "[फोटो पाठवला]"
+        await register_complaint(sender, option_label, details, media_id=media_id)
         return
 
     # ── Handle text messages ──────────────────────────────────────────────
@@ -757,11 +763,16 @@ async def process_message(sender: str, message: dict):
                 await send_acknowledgement(sender, option_label)
             return
 
-        # If awaiting image but user sent text instead
+        # Waiting for the photo, and the citizen typed their details first.
+        # Keep the text — it used to be discarded — and still ask for the photo.
         if session.get("state") == "awaiting_image":
+            collected = session.get("details", "")
+            session["details"] = f"{collected} / {text_body_raw}".strip(" /") if collected else text_body_raw
+            user_sessions[sender] = session
             await send_text_message(
                 sender,
-                "⚠️ कृपया फोटो पाठवा. तक्रार नोंदवण्यासाठी फोटो आवश्यक आहे. 📸"
+                "✅ माहिती मिळाली.\n\n"
+                "📸 आता कृपया समस्येचा फोटो पाठवा. तक्रार नोंदवण्यासाठी फोटो आवश्यक आहे."
             )
             return
 
