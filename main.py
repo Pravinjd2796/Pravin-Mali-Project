@@ -7,6 +7,8 @@ Language: Marathi
 
 import os
 import logging
+import asyncio
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Query, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -23,6 +25,25 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 
 WHATSAPP_API_URL = f"https://graph.facebook.com/v19.0/{PHONE_NUMBER_ID}/messages"
 
+# ─── Complaint forwarding + manual reply relay ───────────────────────────────
+# OWNER_PHONE receives every complaint and can reply to citizens with "#47 text".
+OWNER_PHONE = os.getenv("OWNER_PHONE", "").strip()
+ALERT_TEMPLATE = os.getenv("ALERT_TEMPLATE", "complaint_forward").strip()
+ALERT_TEMPLATE_LANG = os.getenv("ALERT_TEMPLATE_LANG", "en_US").strip()
+
+# Google Sheet used as the complaint register
+SHEET_ID = os.getenv("SHEET_ID", "").strip()
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+# How long the bot stays quiet for a citizen after the owner takes over
+HANDOFF_MINUTES = int(os.getenv("HANDOFF_MINUTES", "30"))
+
+IST = timezone(timedelta(hours=5, minutes=30))
+SHEET_HEADER = [
+    "Ticket", "Date (IST)", "Citizen Phone", "Type",
+    "Details", "Status", "Reply", "Replied At",
+]
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -36,6 +57,15 @@ user_sessions: dict[str, dict] = {}
 # Note: In production, use a database/cache with a TTL. For now, we use a simple set.
 PROCESSED_MESSAGES = set()
 MAX_PROCESSED_HISTORY = 1000  # Prevent memory leak
+
+# ─── Handoff / ticket state ──────────────────────────────────────────────────
+# While the owner is talking to a citizen, the bot keeps quiet for that citizen.
+# Key: citizen phone, Value: unix timestamp when the bot resumes
+handoff_until: dict[str, float] = {}
+
+# Ticket number <-> citizen phone. Rebuilt from the Sheet after a restart.
+ticket_to_phone: dict[str, str] = {}
+phone_to_ticket: dict[str, str] = {}
 
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -61,12 +91,16 @@ async def send_text_message(to: str, text: str):
         "type": "text",
         "text": {"body": text},
     }
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(WHATSAPP_API_URL, headers=headers, json=payload)
-        logger.info(f"Text message sent to {to} — Status: {resp.status_code}")
-        if resp.status_code != 200:
-            logger.error(f"Error response: {resp.text}")
-        return resp
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(WHATSAPP_API_URL, headers=headers, json=payload)
+            logger.info(f"Text message sent to {to} — Status: {resp.status_code}")
+            if resp.status_code != 200:
+                logger.error(f"Error response: {resp.text}")
+            return resp
+    except Exception as exc:
+        logger.error(f"Text send to {to} failed: {exc}")
+        return None
 
 
 async def send_interactive_buttons(to: str):
@@ -213,6 +247,247 @@ async def send_image_received_response(to: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  GOOGLE SHEET — complaint register
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_worksheet = None
+
+
+def _get_worksheet():
+    """Open (and cache) the first tab of the complaint Sheet. Blocking call."""
+    global _worksheet
+    if _worksheet is not None:
+        return _worksheet
+    if not (SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
+        return None
+
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    creds = Credentials.from_service_account_info(
+        json.loads(GOOGLE_SERVICE_ACCOUNT_JSON),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    ws = gspread.authorize(creds).open_by_key(SHEET_ID).sheet1
+
+    # Write the header row once, on a blank sheet.
+    if not ws.get_all_values():
+        ws.append_row(SHEET_HEADER)
+
+    _worksheet = ws
+    return _worksheet
+
+
+def _sheet_append_sync(row: list) -> int:
+    """Append a complaint row. Returns the ticket number (the row number)."""
+    ws = _get_worksheet()
+    if ws is None:
+        return 0
+    ws.append_row(row, value_input_option="USER_ENTERED")
+    return len(ws.col_values(1)) - 1  # minus the header row
+
+
+def _sheet_lookup_phone_sync(ticket: str) -> str | None:
+    """Find the citizen's phone for a ticket — used after a restart."""
+    ws = _get_worksheet()
+    if ws is None:
+        return None
+    for row in ws.get_all_values()[1:]:
+        if row and row[0] == ticket:
+            return row[2] or None
+    return None
+
+
+def _sheet_record_reply_sync(ticket: str, reply: str) -> None:
+    """Store the owner's reply against the ticket and mark it Replied."""
+    ws = _get_worksheet()
+    if ws is None:
+        return
+    for idx, row in enumerate(ws.get_all_values()[1:], start=2):
+        if row and row[0] == ticket:
+            ws.update(
+                f"F{idx}:H{idx}",
+                [["Replied", reply, datetime.now(IST).strftime("%d-%m-%Y %H:%M")]],
+            )
+            return
+
+
+async def sheet_append(row: list) -> int:
+    try:
+        return await asyncio.to_thread(_sheet_append_sync, row)
+    except Exception as exc:                      # never break the bot over logging
+        logger.error(f"Sheet append failed: {exc}")
+        return 0
+
+
+async def sheet_lookup_phone(ticket: str) -> str | None:
+    try:
+        return await asyncio.to_thread(_sheet_lookup_phone_sync, ticket)
+    except Exception as exc:
+        logger.error(f"Sheet lookup failed: {exc}")
+        return None
+
+
+async def sheet_record_reply(ticket: str, reply: str) -> None:
+    try:
+        await asyncio.to_thread(_sheet_record_reply_sync, ticket, reply)
+    except Exception as exc:
+        logger.error(f"Sheet reply update failed: {exc}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FORWARDING TO THE OWNER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def send_template_alert(to: str, complaint_type: str, details: str, citizen: str):
+    """
+    Send the complaint to the owner using the approved template.
+    Templates work outside the 24-hour window; plain text does not.
+    """
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "template",
+        "template": {
+            "name": ALERT_TEMPLATE,
+            "language": {"code": ALERT_TEMPLATE_LANG},
+            "components": [{
+                "type": "body",
+                "parameters": [
+                    {"type": "text", "text": complaint_type},
+                    {"type": "text", "text": details},
+                    {"type": "text", "text": citizen},
+                ],
+            }],
+        },
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(WHATSAPP_API_URL, headers=headers, json=payload)
+        logger.info(f"Template alert to {to} — Status: {resp.status_code}")
+        if resp.status_code != 200:
+            logger.error(f"Template alert failed: {resp.text}")
+        return resp
+
+
+async def notify_owner(ticket: str, complaint_type: str, details: str, citizen: str):
+    """
+    Tell the owner about a new complaint.
+
+    Plain text is tried first because it carries the #ticket reply instructions.
+    It only works inside the 24-hour window, so the template is the fallback.
+    """
+    if not OWNER_PHONE:
+        return
+
+    text = (
+        f"🆕 *New complaint  #{ticket}*\n\n"
+        f"प्रकार: {complaint_type}\n"
+        f"माहिती: {details}\n"
+        f"नागरिक: +{citizen}\n\n"
+        f"उत्तर पाठवण्यासाठी: `#{ticket} तुमचा संदेश`\n"
+        f"संभाषण संपवण्यासाठी: `#{ticket} done`"
+    )
+    resp = await send_text_message(OWNER_PHONE, text)
+    if resp is not None and resp.status_code == 200:
+        return
+
+    # Outside the 24-hour window — fall back to the approved template.
+    logger.info("Owner outside 24h window, sending template instead")
+    flat = details.replace("\n", " / ")
+    await send_template_alert(OWNER_PHONE, f"#{ticket} {complaint_type}", flat, f"+{citizen}")
+
+
+async def register_complaint(citizen: str, complaint_type: str, details: str):
+    """Log the complaint to the Sheet, then alert the owner."""
+    row_no = await sheet_append([
+        "",                                            # ticket, filled in below
+        datetime.now(IST).strftime("%d-%m-%Y %H:%M"),
+        citizen,
+        complaint_type,
+        details,
+        "Open",
+        "",
+        "",
+    ])
+    ticket = str(row_no) if row_no else str(int(time.time()) % 10000)
+
+    # Write the ticket number back into the row we just created.
+    if row_no:
+        try:
+            await asyncio.to_thread(
+                lambda: _get_worksheet().update_acell(f"A{row_no + 1}", ticket)
+            )
+        except Exception as exc:
+            logger.error(f"Ticket write-back failed: {exc}")
+
+    ticket_to_phone[ticket] = citizen
+    phone_to_ticket[citizen] = ticket
+    logger.info(f"Complaint #{ticket} registered from {citizen} ({complaint_type})")
+
+    await notify_owner(ticket, complaint_type, details, citizen)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  OWNER COMMANDS  —  "#47 message"  /  "#47 done"
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_owner_command(text: str) -> bool:
+    """
+    Handle a "#<ticket> ..." message from the owner.
+    Returns True if the message was an owner command.
+    """
+    if not text.startswith("#"):
+        return False
+
+    parts = text[1:].split(maxsplit=1)
+    if not parts:
+        return False
+
+    ticket = parts[0]
+    body = parts[1].strip() if len(parts) > 1 else ""
+
+    citizen = ticket_to_phone.get(ticket) or await sheet_lookup_phone(ticket)
+    if not citizen:
+        await send_text_message(OWNER_PHONE, f"⚠️ Ticket #{ticket} सापडले नाही.")
+        return True
+    ticket_to_phone[ticket] = citizen
+
+    if not body:
+        await send_text_message(OWNER_PHONE, f"⚠️ संदेश रिकामा आहे. वापरा: #{ticket} तुमचा संदेश")
+        return True
+
+    # End the handoff — the bot takes over again.
+    if body.lower() in {"done", "end", "close", "बंद"}:
+        handoff_until.pop(citizen, None)
+        user_sessions[citizen] = {"state": "idle"}
+        await send_text_message(OWNER_PHONE, f"✅ #{ticket} बंद केले. बॉट पुन्हा सुरू.")
+        return True
+
+    # Relay the owner's message to the citizen, from the helpline number.
+    resp = await send_text_message(citizen, body)
+    if resp is not None and resp.status_code == 200:
+        handoff_until[citizen] = time.time() + HANDOFF_MINUTES * 60
+        await sheet_record_reply(ticket, body)
+        await send_text_message(OWNER_PHONE, f"✅ #{ticket} ला पाठवले.")
+    else:
+        await send_text_message(
+            OWNER_PHONE,
+            f"❌ #{ticket} ला पाठवता आले नाही. नागरिकाने २४ तासांत संदेश पाठवलेला नसावा.",
+        )
+    return True
+
+
+async def forward_citizen_reply(citizen: str, text: str) -> None:
+    """During a handoff, pass what the citizen says straight to the owner."""
+    ticket = phone_to_ticket.get(citizen, "?")
+    await send_text_message(OWNER_PHONE, f"💬 *#{ticket}* +{citizen}:\n{text}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  OPTION LABELS (Marathi)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -245,6 +520,21 @@ async def process_message(sender: str, message: dict):
     msg_type = message.get("type")
     session = user_sessions.get(sender, {"state": "idle"})
 
+    # ── Owner commands: "#47 message" / "#47 done" ────────────────────────
+    if OWNER_PHONE and sender == OWNER_PHONE and msg_type == "text":
+        owner_text = message.get("text", {}).get("body", "").strip()
+        if await handle_owner_command(owner_text):
+            return
+
+    # ── Handoff: owner is talking to this citizen, so the bot keeps quiet ──
+    if handoff_until.get(sender, 0) > time.time():
+        if msg_type == "text":
+            await forward_citizen_reply(sender, message.get("text", {}).get("body", ""))
+        else:
+            await forward_citizen_reply(sender, f"[{msg_type} पाठवले]")
+        return
+    handoff_until.pop(sender, None)
+
     # ── Handle interactive list reply (button selection) ──────────────────
     if msg_type == "interactive":
         interactive = message.get("interactive", {})
@@ -275,13 +565,21 @@ async def process_message(sender: str, message: dict):
     # ── Handle image upload ───────────────────────────────────────────────
     if msg_type == "image" and session.get("state") == "awaiting_image":
         logger.info(f"Image received from {sender} for {session.get('selected_option')}")
+        option_label = OPTION_LABELS.get(session.get("selected_option"), "अज्ञात")
+        caption = message.get("image", {}).get("caption", "").strip()
         user_sessions[sender] = {"state": "idle"}
         await send_image_received_response(sender)
+        await register_complaint(
+            sender,
+            option_label,
+            f"{caption} [फोटो पाठवला]" if caption else "[फोटो पाठवला]",
+        )
         return
 
     # ── Handle text messages ──────────────────────────────────────────────
     if msg_type == "text":
-        text_body = message.get("text", {}).get("body", "").strip().lower()
+        text_body_raw = message.get("text", {}).get("body", "").strip()
+        text_body = text_body_raw.lower()
 
         # Greetings trigger the menu
         greetings = {"hi", "hello", "hey", "नमस्कार", "नमस्ते", "हाय", "हॅलो"}
@@ -325,6 +623,7 @@ async def process_message(sender: str, message: dict):
 
         # Handle details being sent (Name, Address, etc.)
         if session.get("state") == "awaiting_details":
+            option_label = OPTION_LABELS.get(session.get("selected_option"), "अज्ञात")
             user_sessions[sender] = {"state": "idle"}
             await send_text_message(
                 sender,
@@ -334,6 +633,7 @@ async def process_message(sender: str, message: dict):
                 "अधिक मदतीसाठी कृपया खालील क्रमांकावर संपर्क साधा:\n"
                 "📞 *9272511811*"
             )
+            await register_complaint(sender, option_label, text_body_raw)
             return
 
         # NEW: Only send the default greeting for unrecognized TEXT
