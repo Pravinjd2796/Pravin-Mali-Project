@@ -67,6 +67,13 @@ handoff_until: dict[str, float] = {}
 ticket_to_phone: dict[str, str] = {}
 phone_to_ticket: dict[str, str] = {}
 
+# WhatsApp message id of each alert we send the owner -> ticket.
+# Lets the owner simply *reply to* an alert instead of typing "#12".
+alert_msg_to_ticket: dict[str, str] = {}
+
+# The most recent ticket, used when the owner just types a message with no tag.
+last_ticket: str | None = None
+
 # ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Pravin Mali Help Line",
@@ -398,11 +405,19 @@ async def notify_owner(ticket: str, complaint_type: str, details: str, citizen: 
         f"प्रकार: {complaint_type}\n"
         f"माहिती: {details}\n"
         f"नागरिक: +{citizen}\n\n"
-        f"उत्तर पाठवण्यासाठी: `#{ticket} तुमचा संदेश`\n"
-        f"संभाषण संपवण्यासाठी: `#{ticket} done`"
+        f"उत्तर पाठवण्यासाठी: `{ticket} तुमचा संदेश`\n"
+        f"किंवा या मेसेजला थेट Reply करा.\n"
+        f"संभाषण संपवण्यासाठी: `{ticket} done`"
     )
     resp = await send_text_message(OWNER_PHONE, text)
     if resp is not None and resp.status_code == 200:
+        # Remember which alert this was, so a WhatsApp "reply" to it routes back
+        # to the right citizen without the owner typing the ticket number.
+        try:
+            wamid = resp.json()["messages"][0]["id"]
+            alert_msg_to_ticket[wamid] = ticket
+        except Exception:
+            pass
         return
 
     # Outside the 24-hour window — fall back to the approved template.
@@ -425,8 +440,10 @@ async def register_complaint(citizen: str, complaint_type: str, details: str):
     ])
     ticket = str(row_no) if row_no else str(int(time.time()) % 10000)
 
+    global last_ticket
     ticket_to_phone[ticket] = citizen
     phone_to_ticket[citizen] = ticket
+    last_ticket = ticket
     logger.info(f"Complaint #{ticket} registered from {citizen} ({complaint_type})")
 
     await notify_owner(ticket, complaint_type, details, citizen)
@@ -436,29 +453,46 @@ async def register_complaint(citizen: str, complaint_type: str, details: str):
 #  OWNER COMMANDS  —  "#47 message"  /  "#47 done"
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def handle_owner_command(text: str) -> bool:
-    """
-    Handle a "#<ticket> ..." message from the owner.
-    Returns True if the message was an owner command.
-    """
-    if not text.startswith("#"):
-        return False
+OWNER_GREETINGS = {"hi", "hello", "hey", "नमस्कार", "नमस्ते", "हाय", "हॅलो", "menu", "मेनू"}
 
-    parts = text[1:].split(maxsplit=1)
-    if not parts:
-        return False
 
-    ticket = parts[0]
-    body = parts[1].strip() if len(parts) > 1 else ""
+async def handle_owner_command(text: str, reply_to: str | None = None) -> bool:
+    """
+    Handle a message from the owner. The ticket can be given three ways:
+
+      1. "12 message"   — just the complaint number, easiest
+      2. "#12 message"  — same thing with a hash
+      3. replying to an alert in WhatsApp — ticket matched by message id
+
+    Returns True if the message was handled as an owner command.
+    """
+    if text.lower() in OWNER_GREETINGS:
+        return False                      # owner can still use the bot normally
+
+    ticket, body = None, ""
+
+    # "12 message" or "#12 message"
+    parts = text.lstrip("#").split(maxsplit=1)
+    if parts and parts[0].isdigit():
+        ticket = parts[0]
+        body = parts[1].strip() if len(parts) > 1 else ""
+
+    # Replying to an alert in WhatsApp — no number needed at all.
+    elif reply_to and reply_to in alert_msg_to_ticket:
+        ticket = alert_msg_to_ticket[reply_to]
+        body = text.strip()
+
+    if not ticket:
+        return False                      # not a reply — handle as a normal message
 
     citizen = ticket_to_phone.get(ticket) or await sheet_lookup_phone(ticket)
     if not citizen:
-        await send_text_message(OWNER_PHONE, f"⚠️ Ticket #{ticket} सापडले नाही.")
-        return True
+        # Unknown number — probably an ordinary message, not a reply.
+        return False
     ticket_to_phone[ticket] = citizen
 
     if not body:
-        await send_text_message(OWNER_PHONE, f"⚠️ संदेश रिकामा आहे. वापरा: #{ticket} तुमचा संदेश")
+        await send_text_message(OWNER_PHONE, f"⚠️ संदेश रिकामा आहे. वापरा: {ticket} तुमचा संदेश")
         return True
 
     # End the handoff — the bot takes over again.
@@ -524,7 +558,8 @@ async def process_message(sender: str, message: dict):
     # ── Owner commands: "#47 message" / "#47 done" ────────────────────────
     if OWNER_PHONE and sender == OWNER_PHONE and msg_type == "text":
         owner_text = message.get("text", {}).get("body", "").strip()
-        if await handle_owner_command(owner_text):
+        reply_to = message.get("context", {}).get("id")
+        if await handle_owner_command(owner_text, reply_to):
             return
 
     # ── Handoff: owner is talking to this citizen, so the bot keeps quiet ──
