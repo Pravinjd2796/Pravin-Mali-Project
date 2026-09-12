@@ -389,6 +389,33 @@ async def sheet_record_reply(ticket: str, reply: str) -> None:
 #  FORWARDING TO THE OWNER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+async def send_image_by_id(to: str, media_id: str, caption: str = ""):
+    """
+    Forward a photo the citizen sent, using its media id.
+
+    Media already lives on Meta's servers, so it can be re-sent by id — no
+    download and no storage on our side.
+    """
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    image: dict = {"id": media_id}
+    if caption:
+        image["caption"] = caption[:1024]
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "image", "image": image}
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(WHATSAPP_API_URL, headers=headers, json=payload)
+            logger.info(f"Photo forwarded to {to} — Status: {resp.status_code}")
+            if resp.status_code != 200:
+                logger.error(f"Photo forward failed: {resp.text}")
+            return resp
+    except Exception as exc:
+        logger.error(f"Photo forward to {to} failed: {exc}")
+        return None
+
+
 async def send_template_alert(to: str, complaint_type: str, details: str, citizen: str):
     """
     Send the complaint to the owner using the approved template.
@@ -458,7 +485,8 @@ async def notify_owner(ticket: str, complaint_type: str, details: str, citizen: 
         await send_template_alert(owner, f"#{ticket} {complaint_type}", flat, f"+{citizen}")
 
 
-async def register_complaint(citizen: str, complaint_type: str, details: str):
+async def register_complaint(citizen: str, complaint_type: str, details: str,
+                             media_id: str | None = None):
     """Log the complaint to the Sheet, then alert the owner."""
     row_no = await sheet_append([
         "",                                            # ticket, filled in below
@@ -479,6 +507,11 @@ async def register_complaint(citizen: str, complaint_type: str, details: str):
     logger.info(f"Complaint #{ticket} registered from {citizen} ({complaint_type})")
 
     await notify_owner(ticket, complaint_type, details, citizen)
+
+    # Send the actual photo on to every owner, right after the alert.
+    if media_id:
+        for owner in OWNER_PHONES:
+            await send_image_by_id(owner, media_id, f"📷 #{ticket} — {complaint_type}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -632,6 +665,13 @@ async def process_message(sender: str, message: dict):
     if handoff_until.get(sender, 0) > time.time():
         if msg_type == "text":
             await forward_citizen_reply(sender, message.get("text", {}).get("body", ""))
+        elif msg_type == "image":
+            # Pass the photo itself on, not just a note that one arrived.
+            ticket = phone_to_ticket.get(sender, "?")
+            caption = message.get("image", {}).get("caption", "").strip()
+            media_id = message.get("image", {}).get("id")
+            for owner in OWNER_PHONES:
+                await send_image_by_id(owner, media_id, f"📷 #{ticket} +{sender}: {caption}".strip())
         else:
             await forward_citizen_reply(sender, f"[{msg_type} पाठवले]")
         return
@@ -669,12 +709,14 @@ async def process_message(sender: str, message: dict):
         logger.info(f"Image received from {sender} for {session.get('selected_option')}")
         option_label = OPTION_LABELS.get(session.get("selected_option"), "अज्ञात")
         caption = message.get("image", {}).get("caption", "").strip()
+        media_id = message.get("image", {}).get("id")
         user_sessions[sender] = {"state": "idle"}
         await send_image_received_response(sender)
         await register_complaint(
             sender,
             option_label,
             f"{caption} [फोटो पाठवला]" if caption else "[फोटो पाठवला]",
+            media_id=media_id,
         )
         return
 
