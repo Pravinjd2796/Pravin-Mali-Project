@@ -18,3 +18,20 @@ ENV/
 
 # Local database (optional, since we aren't using DB yet)
 *.db
+
+# Business / personal documents — NEVER commit (repo is public)
+gst_sunshine/
+udyam_sunshine/
+*.pdf
+pravin_mali_marriage_Cert.jpg
+*marriage*
+*certificate*
+*Certificate*
+*pan_card*
+*passport*
+*aadhaar*
+*aadhar*
+*.jpg
+*.jpeg
+*.png
+!sunshine_advertising/static/images/*

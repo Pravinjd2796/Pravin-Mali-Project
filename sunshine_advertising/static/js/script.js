@@ -23,8 +23,8 @@ const translations = {
         fleet_title: "Our Massive Fleet",
         fleet_p: "With 172 high-quality LED Vans and Walls, we cover Dharashiv and beyond for any event scale.",
         footer_bot: "Nagarsevak Pravin Mali Help Line — A Citizen Initiative by Sunshine Advertising",
-        address: "Jijau Chowk, Barshi Naka, Dharashiv (Osmanabad) - 413501",
-        phone: "Contact: 9272511811 / 7030 811 811",
+        address: "Jijau Chouk, Barshi Naka, Osmanabad (Dharashiv), Maharashtra - 413501",
+        phone: "Contact: 9975 802 584 / 9272511811 / 7030 811 811",
         follow: "Follow us on"
     },
     mr: {
@@ -49,8 +49,8 @@ const translations = {
         fleet_title: "आमचा प्रचंड ताफा",
         fleet_p: "१७२ उच्च दर्जाच्या एलईडी व्हॅन्ससह, आम्ही धाराशिव आणि इतर भागात कोणत्याही स्तरावरील कार्यक्रमासाठी सज्ज आहोत.",
         footer_bot: "नगरसेवक प्रविण माळी हेल्पलाईन — सनशाईन ॲडव्हर्टायझिंगचा एक उपक्रम",
-        address: "जिजाऊ चौक, बार्शी नाका, धाराशिव (उस्मानाबाद) - ४१३५०१",
-        phone: "संपर्क: ९२७२५११८११ / ७०३० ८११ ८११",
+        address: "जिजाऊ चौक, बार्शी नाका, उस्मानाबाद (धाराशिव), महाराष्ट्र - ४१३५०१",
+        phone: "संपर्क: ९९७५ ८०२ ५८४ / ९२७२५११८११ / ७०३० ८११ ८११",
         follow: "येथे फॉलो करा"
     }
 };
