@@ -76,6 +76,16 @@ alert_msg_to_ticket: dict[str, str] = {}
 # The most recent ticket, used when the owner just types a message with no tag.
 last_ticket: str | None = None
 
+# The first owner to reply to a ticket claims it, so a complainant never gets two
+# answers. The claim lapses after HANDOFF_MINUTES so a forgotten ticket frees
+# itself and somebody else can step in.
+# Key: ticket, Value: (owner phone, unix time the claim expires)
+ticket_claimed_by: dict[str, tuple[str, float]] = {}
+
+# Tickets that were closed with "done". Replying to one is allowed — people do
+# follow up — but every owner is told it was reopened.
+closed_tickets: set[str] = set()
+
 # Ticket numbers used when the Sheet is unavailable. Kept unique and clear of
 # the Sheet's own row numbers, so two complaints can never share a ticket.
 _fallback_seq = 0
@@ -509,9 +519,23 @@ async def handle_owner_command(text: str, sender: str, reply_to: str | None = No
         await send_text_message(sender, f"⚠️ संदेश रिकामा आहे. वापरा: {ticket} तुमचा संदेश")
         return True
 
+    # Whoever replied first owns this ticket, until the claim lapses.
+    claim = ticket_claimed_by.get(ticket)
+    if claim and claim[0] != sender and time.time() < claim[1]:
+        mins = max(1, int((claim[1] - time.time()) // 60))
+        await send_text_message(
+            sender,
+            f"🔒 *#{ticket}* आधीच +{claim[0]} हाताळत आहेत.\n"
+            f"कृपया दुसरे उत्तर पाठवू नका.\n"
+            f"({mins} मिनिटांनंतर तुम्ही उत्तर देऊ शकता.)",
+        )
+        return True
+
     # End the handoff — the bot takes over again.
     if body.lower() in {"done", "end", "close", "बंद"}:
         handoff_until.pop(citizen, None)
+        ticket_claimed_by.pop(ticket, None)
+        closed_tickets.add(ticket)
         user_sessions[citizen] = {"state": "idle"}
         for owner in OWNER_PHONES:
             await send_text_message(owner, f"✅ #{ticket} बंद केले. बॉट पुन्हा सुरू.")
@@ -521,12 +545,18 @@ async def handle_owner_command(text: str, sender: str, reply_to: str | None = No
     resp = await send_text_message(citizen, body)
     if resp is not None and resp.status_code == 200:
         handoff_until[citizen] = time.time() + HANDOFF_MINUTES * 60
+        ticket_claimed_by[ticket] = (sender, time.time() + HANDOFF_MINUTES * 60)
+        reopened = ticket in closed_tickets
+        closed_tickets.discard(ticket)
         await sheet_record_reply(ticket, body)
         await send_text_message(sender, f"✅ #{ticket} ला पाठवले.")
         # Keep the other owners in the loop so nobody replies twice.
+        note = f"⚠️ *#{ticket}* बंद झाले होते — +{sender} यांनी पुन्हा सुरू केले.\n" if reopened else ""
         for owner in OWNER_PHONES:
             if owner != sender:
-                await send_text_message(owner, f"↪️ *#{ticket}* +{sender} यांनी उत्तर दिले:\n{body}")
+                await send_text_message(owner, f"{note}↪️ *#{ticket}* +{sender} यांनी उत्तर दिले:\n{body}")
+            elif reopened:
+                await send_text_message(owner, f"⚠️ #{ticket} बंद झाले होते — पुन्हा सुरू केले.")
     else:
         await send_text_message(
             sender,
